@@ -1,0 +1,24 @@
+name = "llm-api-fake"
+main = "src/worker.ts"
+compatibility_date = "2025-08-01"
+workers_dev = true
+
+# 自定义域名：wrangler 部署时自动在 yexiangha.top 区域创建 llm 的 DNS 记录并绑定 Worker
+routes = [
+  { pattern = "llm.yexiangha.top", custom_domain = true }
+]
+
+[vars]
+SERVICE_NAME = "llm.yexiangha.top · 假 LLM API"
+SERVICE_VERSION = "1.0.0"
+
+# 自定义响应规则存这里（每 10 秒内存缓存一次，后台改完秒级生效）
+[[kv_namespaces]]
+binding = "LLM_FAKE_KV"
+id = "96ea872161ee4f8db843b67ec03bdbdb"
+
+[observability]
+enabled = true
+
+# 不设置 ADMIN_PASSWORD secret 时，后台会自动生成一次性令牌（见 /admin 页面提示）；
+# 设置后则使用固定密码：wrangler secret put ADMIN_PASSWORD
