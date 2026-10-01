@@ -35,6 +35,7 @@ import {
   shortHash,
   type TemplateVars,
 } from './lib/template';
+import { explainCodes, gateConfig, gateCookieValid, issueGateCookie, verifyTurnstile } from './lib/turnstile';
 
 export interface Env {
   LLM_FAKE_KV: KVNamespace;
@@ -42,6 +43,11 @@ export interface Env {
   ADMIN_PASSWORD?: string;
   SERVICE_NAME?: string;
   SERVICE_VERSION?: string;
+  /** Cloudflare Turnstile：两个都配置后才开启人机认证 */
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_SECRET_KEY?: string;
+  /** 仅本地测试用：把 siteverify 指到自建假端 */
+  TURNSTILE_VERIFY_URL?: string;
 }
 
 const VERSION = '1.0.0';
@@ -59,10 +65,10 @@ function json(data: unknown, status = 200, extra: Record<string, string> = {}): 
   return new Response(JSON.stringify(data, null, 2), { status, headers: { ...CORS, ...JSON_HEADERS, ...extra } });
 }
 
-function html(body: string, status = 200): Response {
+function html(body: string, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(body, {
     status,
-    headers: { ...CORS, 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+    headers: { ...CORS, 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...extra },
   });
 }
 
@@ -405,19 +411,80 @@ export default {
 
 /* ---------------------------- 管理后台 ---------------------------- */
 
-async function adminPage(env: Env, req: Request): Promise<Response> {
+async function adminPage(env: Env, req: Request, url: URL): Promise<Response> {
   const auth = await adminAuth(req, env);
+  const gate = gateConfig(env);
+  const gateOk = !gate.enabled || (await gateCookieValid(req, env));
   const dynamicToken = auth.dynamic && auth.ok ? await env.LLM_FAKE_KV.get(TOKEN_KEY) : null;
-  const page = ADMIN_HTML.replace(/\{\{SERVICE_NAME\}\}/g, escapeHtml(env.SERVICE_NAME || 'llm-api-fake'))
-    .replace(/\{\{MODE\}\}/g, env.ADMIN_PASSWORD ? 'secret' : 'dynamic')
-    .replace(/\{\{DYNAMIC_TOKEN\}\}/g, dynamicToken ? escapeHtml(dynamicToken) : '');
-  return html(page);
+  const config = {
+    gateEnabled: gate.enabled,
+    gateOk,
+    siteKey: gate.siteKey,
+    mode: env.ADMIN_PASSWORD ? 'secret' : 'dynamic',
+    dynamicToken: dynamicToken || '',
+    message: (url.searchParams.get('msg') || '').slice(0, 200),
+    error: (url.searchParams.get('err') || '').slice(0, 200),
+  };
+  const page = ADMIN_HTML.replace(/\{\{SERVICE_NAME\}\}/g, escapeHtml(env.SERVICE_NAME || 'llm-api-fake')).replace(
+    /\{\{CONFIG_JSON\}\}/g,
+    JSON.stringify(config).replace(/</g, '\\u003c'),
+  );
+  return html(page, 200, { 'x-robots-tag': 'noindex' });
+}
+
+/**
+ * 校验 Turnstile 并下发会话 Cookie。
+ * 用表单提交（而非 fetch）是为了让 Set-Cookie 直接生效后整页跳转，逻辑最简单可靠。
+ */
+async function handleVerifyHuman(req: Request, env: Env): Promise<Response> {
+  const gate = gateConfig(env);
+  if (!gate.enabled) return redirect('/admin');
+
+  const form = await req.formData().catch(() => null);
+  const token = String(form?.get('cf-turnstile-response') || req.headers.get('cf-turnstile-response') || '');
+  const result = await verifyTurnstile(env, token, req.headers.get('cf-connecting-ip'));
+
+  if (!result.success) {
+    const reason = result.error || explainCodes(result.codes);
+    console.log(`[turnstile] 验证失败: ${reason} codes=${JSON.stringify(result.codes)}`);
+    // 用 400 而不是 3xx：这是"请求未被接受"，浏览器会直接显示错误页，语义也更准确
+    return redirect(`/admin?err=${encodeURIComponent(`人机验证未通过：${reason}`)}`, 400);
+  }
+
+  const cookie = await issueGateCookie(env);
+  return new Response(null, { status: 303, headers: { location: '/admin?msg=' + encodeURIComponent('人机验证通过'), 'set-cookie': cookie } });
+}
+
+function redirect(to: string, status = 303): Response {
+  return new Response(null, { status, headers: { location: to } });
 }
 
 async function handleAdmin(req: Request, env: Env, url: URL, path: string, method: string): Promise<Response> {
-  if (!path.startsWith('/admin/api')) return adminPage(env, req);
+  if (!path.startsWith('/admin/api')) return adminPage(env, req, url);
 
   const route = path.slice('/admin/api'.length).replace(/^\/+/, '');
+  const gate = gateConfig(env);
+
+  // 人机验证入口本身当然不能要求"已经通过验证"
+  if (route === 'verify-human') {
+    if (method !== 'POST') return json({ ok: false, error: '请用 POST 提交' }, 405);
+    return handleVerifyHuman(req, env);
+  }
+
+  // 第一道：人机认证（Turnstile 配置了才开）
+  if (gate.enabled && !(await gateCookieValid(req, env))) {
+    return json(
+      {
+        ok: false,
+        error: '需要先通过人机验证',
+        code: 'human_verification_required',
+        hint: '用浏览器打开 /admin 完成 Cloudflare 人机验证后，本次会话（12 小时）即可调用后台接口',
+      },
+      403,
+    );
+  }
+
+  // 第二道：后台密码
   const auth = await adminAuth(req, env);
   if (!auth.ok) {
     return json(
@@ -431,7 +498,7 @@ async function handleAdmin(req: Request, env: Env, url: URL, path: string, metho
   }
 
   if (route === 'session' && method === 'GET') {
-    return json({ ok: true, mode: auth.dynamic ? 'dynamic' : 'secret', justCreated: auth.justCreated });
+    return json({ ok: true, mode: auth.dynamic ? 'dynamic' : 'secret', justCreated: auth.justCreated, gate: gate.enabled });
   }
 
   if (route === 'rules' || route.startsWith('rules/')) {

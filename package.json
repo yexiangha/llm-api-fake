@@ -11,6 +11,8 @@
     "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
     "check": "pnpm run typecheck && pnpm run typecheck:test && pnpm run test",
     "test": "node --test --experimental-strip-types \"test/*.test.ts\"",
+    "test:turnstile": "node scripts/test-turnstile.mjs",
+    "mock:turnstile": "node scripts/mock-turnstile.mjs",
     "kv:token": "wrangler kv key get --binding LLM_FAKE_KV config:admin-token --remote"
   },
   "devDependencies": {

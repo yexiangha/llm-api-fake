@@ -130,50 +130,65 @@ let firstContent = '';
   check('后台占位符全部替换', !/\{\{(SERVICE_NAME|MODE|DYNAMIC_TOKEN)\}\}/.test(admin));
 }
 
-/* 8. 后台鉴权与 CRUD */
+/* 8. 后台鉴权与 CRUD（开着人机认证时，脚本无浏览器会话，只能验证拦截是否正确） */
 if (adminToken) {
   const H = { 'content-type': 'application/json', 'x-admin-token': adminToken };
-  const list = await (await fetch(`${base}/admin/api/rules`, { headers: H })).json();
-  check('后台可读取规则', list.ok === true, list.error);
 
-  const wrong = await fetch(`${base}/admin/api/rules`, { headers: { 'x-admin-token': 'definitely-wrong' } });
-  check('错误令牌被拒 401', wrong.status === 401, String(wrong.status));
+  // 先探测后台是否开着人机认证
+  const probe = await fetch(`${base}/admin/api/rules`);
+  const probeJson = await probe.json().catch(() => ({}));
+  const gateOn = probe.status === 403 && probeJson.code === 'human_verification_required';
 
-  const created = await (await fetch(`${base}/admin/api/rules`, {
-    method: 'POST',
-    headers: H,
-    body: JSON.stringify({ name: '冒烟规则', id: 'smoke-test', match: { regex: '^冒烟专用' }, content: '冒烟命中：{{user}} · {{rand}}', priority: 99 }),
-  })).json();
-  check('创建规则成功', created.ok === true, created.error);
+  if (gateOn) {
+    check('人机认证开启：未验证访问后台 API 返回 403', probe.status === 403, `HTTP ${probe.status}`);
+    check('403 标记 human_verification_required', probeJson.code === 'human_verification_required');
+    const page = await (await fetch(`${base}/admin`)).text();
+    check('后台页面含 Turnstile 挂件与 sitekey', page.includes('gateHuman') && /"siteKey":"[^"]+"/.test(page));
+    check('未验证时页面不吐规则数据', !page.includes('rules.json') && !page.includes('"rules":['));
+    console.log('  \x1b[33mSKIP\x1b[0m  后台 CRUD（该实例要求浏览器人机验证，先跑 scripts/test-turnstile.mjs 或人工过验证）');
+  } else {
+    const list = await (await fetch(`${base}/admin/api/rules`, { headers: H })).json();
+    check('后台可读取规则', list.ok === true, list.error);
 
-  // KV 是最终一致的：写入后最多 60 秒才全球可见。这里做成"反复探测直到生效"，
-  // 只要在容忍窗口内生效就算通过（本地 wrangler dev 通常 11 秒内即可）。
-  const waitMs = Number(process.env.PROPAGATION_WAIT_MS || 80_000);
-  const deadline = Date.now() + waitMs;
-  let hitText = '';
-  let hitRule = '';
-  let waited = 0;
-  for (;;) {
-    await sleep(11_000);
-    waited += 11_000;
-    const { res, json: hit } = await chat({ model: 'fake-gpt-4o', messages: [{ role: 'user', content: '冒烟专用测试内容' }] });
-    hitText = hit.choices?.[0]?.message?.content || '';
-    hitRule = decodeURIComponent(res.headers.get('x-fake-rule') || '');
-    if (hitText.includes('冒烟命中')) break;
-    if (Date.now() >= deadline) break;
+    const wrong = await fetch(`${base}/admin/api/rules`, { headers: { 'x-admin-token': 'definitely-wrong' } });
+    check('错误令牌被拒 401', wrong.status === 401, String(wrong.status));
+
+    const created = await (await fetch(`${base}/admin/api/rules`, {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify({ name: '冒烟规则', id: 'smoke-test', match: { regex: '^冒烟专用' }, content: '冒烟命中：{{user}} · {{rand}}', priority: 99 }),
+    })).json();
+    check('创建规则成功', created.ok === true, created.error);
+
+    // KV 是最终一致的：写入后最多 60 秒才全球可见。这里做成"反复探测直到生效"，
+    // 只要在容忍窗口内生效就算通过（本地 wrangler dev 通常 11 秒内即可）。
+    const waitMs = Number(process.env.PROPAGATION_WAIT_MS || 80_000);
+    const deadline = Date.now() + waitMs;
+    let hitText = '';
+    let hitRule = '';
+    let waited = 0;
+    for (;;) {
+      await sleep(11_000);
+      waited += 11_000;
+      const { res, json: hit } = await chat({ model: 'fake-gpt-4o', messages: [{ role: 'user', content: '冒烟专用测试内容' }] });
+      hitText = hit.choices?.[0]?.message?.content || '';
+      hitRule = decodeURIComponent(res.headers.get('x-fake-rule') || '');
+      if (hitText.includes('冒烟命中')) break;
+      if (Date.now() >= deadline) break;
+    }
+    check(`新规则在 ${Math.round(waited / 1000)} 秒内生效（KV 最终一致）`, hitText.includes('冒烟命中'), `命中规则=${hitRule} 内容=${hitText.slice(0, 60)}`);
+    check('新规则里的占位符已替换', hitText.includes('冒烟专用测试内容'));
+
+    const badRegex = await fetch(`${base}/admin/api/rules`, { method: 'POST', headers: H, body: JSON.stringify({ id: 'bad-re', match: { regex: '([' }, content: 'x' }) });
+    check('非法正则被拒 400', badRegex.status === 400, String(badRegex.status));
+
+    const del = await (await fetch(`${base}/admin/api/rules/smoke-test`, { method: 'DELETE', headers: H })).json();
+    check('删除规则成功', del.ok === true);
+    await fetch(`${base}/admin/api/rules/bad-re`, { method: 'DELETE', headers: H });
+
+    const t = await (await fetch(`${base}/admin/api/test`, { method: 'POST', headers: H, body: JSON.stringify({ message: '后台试跑' }) })).json();
+    check('后台试跑接口可用', t.ok === true && typeof t.content === 'string');
   }
-  check(`新规则在 ${Math.round(waited / 1000)} 秒内生效（KV 最终一致）`, hitText.includes('冒烟命中'), `命中规则=${hitRule} 内容=${hitText.slice(0, 60)}`);
-  check('新规则里的占位符已替换', hitText.includes('冒烟专用测试内容'));
-
-  const badRegex = await fetch(`${base}/admin/api/rules`, { method: 'POST', headers: H, body: JSON.stringify({ id: 'bad-re', match: { regex: '([' }, content: 'x' }) });
-  check('非法正则被拒 400', badRegex.status === 400, String(badRegex.status));
-
-  const del = await (await fetch(`${base}/admin/api/rules/smoke-test`, { method: 'DELETE', headers: H })).json();
-  check('删除规则成功', del.ok === true);
-  await fetch(`${base}/admin/api/rules/bad-re`, { method: 'DELETE', headers: H });
-
-  const t = await (await fetch(`${base}/admin/api/test`, { method: 'POST', headers: H, body: JSON.stringify({ message: '后台试跑' }) })).json();
-  check('后台试跑接口可用', t.ok === true && typeof t.content === 'string');
 } else {
   console.log('  \x1b[33mSKIP\x1b[0m  后台 CRUD（未提供后台密码参数）');
 }

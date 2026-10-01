@@ -114,6 +114,47 @@ npx wrangler deploy
 - **全局设置**：服务名、默认模型名、默认延迟、是否强制校验 `sk-` 开头的 key
 - **试跑**：输入一句话，直接看会命中哪条规则、返回什么
 
+### 两道门：人机认证 + 后台密码
+
+```
+浏览器 / 脚本  →  ① Cloudflare Turnstile 人机认证  →  ② 后台密码(ADMIN_PASSWORD)  →  规则 CRUD
+                  （挡自动化脚本、爬虫）              （挡知道地址的人）
+```
+
+两者是**叠加**关系，不是替代：
+
+| 层 | 作用范围 | 未通过时 |
+|---|---|---|
+| Turnstile 人机认证 | `/admin` 页面与 `/admin/api/*` | 页面只显示验证挂件（不吐任何规则数据）；API 返回 `403 {"code":"human_verification_required"}` |
+| 后台密码 | 同上 | API 返回 `401` |
+
+通过人机认证后会下发一个 **HttpOnly + Secure + SameSite=Lax 的签名 Cookie**（HMAC-SHA256，绑定后台密码，默认 12 小时）。
+伪造、篡改过期时间、改签名都会被拒；改后台密码则所有旧 Cookie 立即失效。
+
+**开启方式**（不配置就是关闭状态，只留后台密码那一层）：
+
+```bash
+# 1. 在 Cloudflare 后台创建 Turnstile widget
+#    Dashboard → Turnstile → Add widget → 域名填你的域名（如 llm.yexiangha.top）→ 选 Managed
+# 2. 把 sitekey 写进 wrangler.toml 的 [vars]，secret key 存成 secret
+#    TURNSTILE_SITE_KEY = "0x4AAAAAAA..."        # 公开值，写在 [vars] 里
+npx wrangler secret put TURNSTILE_SECRET_KEY    # 私密值，必须走 secret
+npx wrangler deploy
+```
+
+> 用 Cloudflare 官方测试 key（sitekey `1x00000000000000000000AA` + 对应的测试 secret）可以在不建 widget 的情况下先跑通流程。
+
+**本地怎么测人机认证**：仓库里带了可控的假验证端，能在本地完整覆盖"通过 / 重放 / 失败"三条路径——
+
+```bash
+node scripts/mock-turnstile.mjs 8798 &            # 假 siteverify：PASS* 通过、DUP* 重放失败、其它拒绝
+# .dev.vars 里指向它：
+#   TURNSTILE_SITE_KEY=1x00000000000000000000AA
+#   TURNSTILE_SECRET_KEY=dev-local-turnstile-secret
+#   TURNSTILE_VERIFY_URL=http://127.0.0.1:8798/siteverify
+node scripts/test-turnstile.mjs http://127.0.0.1:8799 dev-local-password   # 28 项检查
+```
+
 ### 响应内容里的占位符
 
 把真实请求信息编进假回复，让它更像真的：
@@ -240,6 +281,8 @@ pnpm deploy         # 部署到 Cloudflare
 node scripts/smoke.mjs https://llm.yexiangha.top 你的后台密码   # 线上冒烟（37+ 项）
 node scripts/seed-live.mjs https://llm.yexiangha.top 后台密码    # 给线上灌示例规则
 node scripts/gh-sync.mjs                                          # 网络受限时用 API 推 GitHub
+node scripts/test-turnstile.mjs http://127.0.0.1:8799 后台密码     # 人机认证端到端（28 项）
+node scripts/mock-turnstile.mjs 8798                              # 本地假 siteverify 服务
 
 # 忘了后台令牌（未设置 ADMIN_PASSWORD 时）
 pnpm kv:token
@@ -250,6 +293,9 @@ pnpm kv:token
 | 位置 | 名称 | 说明 |
 |---|---|---|
 | secret | `ADMIN_PASSWORD` | 后台密码；不设置则自动生成令牌存 KV |
+| secret | `TURNSTILE_SECRET_KEY` | Turnstile 私密 key；与 sitekey 同时配置才开启人机认证 |
+| vars | `TURNSTILE_SITE_KEY` | Turnstile 公开 sitekey（可写进 wrangler.toml） |
+| vars | `TURNSTILE_VERIFY_URL` | 仅本地测试：把 siteverify 指到假端，线上不要设 |
 | vars | `SERVICE_NAME` | 服务展示名 |
 | vars | `SERVICE_VERSION` | 版本号（`/health` 与首页展示） |
 | KV | `LLM_FAKE_KV` | 规则与设置存储 |
