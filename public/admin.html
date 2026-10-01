@@ -188,26 +188,26 @@
 </main>
 
 <div id="gate">
-  <!-- 第一层：Cloudflare Turnstile 人机认证 -->
-  <div class="box" id="gateHuman" style="display:none">
-    <h2 style="margin:0 0 .3rem;font-size:15px">请先完成人机验证</h2>
-    <p class="muted" style="margin:.2rem 0 0">本管理后台由 Cloudflare Turnstile 保护，用于阻断自动化脚本与爬虫。</p>
-    <div class="notice ok" id="gateMsg" style="display:none"></div>
-    <div class="notice bad" id="gateErr" style="display:none"></div>
-    <form id="humanForm" method="POST" action="/admin/api/verify-human">
-      <div class="ts-box" id="tsBox"></div>
-      <button type="submit" id="humanBtn" disabled>我已通过验证，进入</button>
-      <p class="muted" style="margin:.7rem 0 0">验证通过后本机 12 小时内免验证；过期重新过一次即可。</p>
-    </form>
-  </div>
-  <!-- 第二层：后台令牌 -->
+  <!-- 第一步：后台密码 -->
   <div class="box" id="gateToken" style="display:none">
     <h2 style="margin:0 0 .3rem;font-size:15px">需要访问令牌</h2>
-    <p class="muted" id="gateHint" style="margin:.2rem 0 .8rem">输入 /admin 后台令牌</p>
-    <span class="shield" id="gateShield" style="display:none">✓ 人机验证已通过</span>
-    <input id="gateInput" type="password" placeholder="令牌 / 密码" autocomplete="current-password" style="margin-top:.8rem">
-    <div class="row" style="margin-top:.9rem"><button id="gateBtn">进入</button><button class="ghost" id="gateSeed" type="button">忘记令牌？</button></div>
-    <p class="muted" id="gateErr2" style="color:var(--bad);margin:.6rem 0 0"></p>
+    <p class="muted" id="gateHint" style="margin:.2rem 0 .8rem">输入后台密码/令牌</p>
+    <div class="notice bad" id="gateErr" style="display:none"></div>
+    <input id="gateInput" type="password" placeholder="令牌 / 密码" autocomplete="current-password">
+    <div class="row" style="margin-top:.9rem"><button id="gateBtn">下一步</button><button class="ghost" id="gateSeed" type="button">忘记令牌？</button></div>
+  </div>
+  <!-- 第二步：Cloudflare Turnstile 人机认证（密码正确后才会出现） -->
+  <div class="box" id="gateHuman" style="display:none">
+    <h2 style="margin:0 0 .3rem;font-size:15px">再确认一下你是人</h2>
+    <p class="muted" style="margin:.2rem 0 0">密码已通过，最后一步：完成 Cloudflare 人机验证即可进入后台。</p>
+    <div class="notice ok" id="gateMsg" style="display:none"></div>
+    <div class="notice bad" id="gateErr2" style="display:none"></div>
+    <div class="ts-box" id="tsBox"></div>
+    <div class="row">
+      <button id="humanBtn" disabled>请先完成上方验证</button>
+      <button class="ghost" id="gateBack" type="button">返回重输密码</button>
+    </div>
+    <p class="muted" style="margin:.7rem 0 0">通过后本机 12 小时内免验证；过期后重新走一次即可。</p>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -215,11 +215,11 @@
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
 <script>
 (function(){
-  var CFG = {{CONFIG_JSON}};                 // 服务端注入：{gateEnabled, gateOk, siteKey, mode, dynamicToken, message, error}
+  var CFG = {{CONFIG_JSON}};                 // 服务端注入：{gateEnabled, humanVerified, siteKey, mode, dynamicToken, message, error}
   var MODE = CFG.mode;                       // secret | dynamic
   var DYNAMIC_TOKEN = CFG.dynamicToken || "";
   var TOKEN_KEY = "llm_fake_admin_token";
-  var state = { rules: [], settings: null, editing: null, token: localStorage.getItem(TOKEN_KEY) || "", turnstileToken: "" };
+  var state = { rules: [], settings: null, editing: null, token: localStorage.getItem(TOKEN_KEY) || "", turnstileToken: "", pending: "", tsWidget: undefined };
 
   var $ = function(id){ return document.getElementById(id); };
   function esc(s){ return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]; }); }
@@ -250,7 +250,7 @@
   }
   function hideGate(){ $("gate").classList.remove("on"); }
 
-  /* ---------- Cloudflare Turnstile ---------- */
+  /* ---------- Cloudflare Turnstile（密码通过后才渲染） ---------- */
   function mountTurnstile(){
     if (!CFG.gateEnabled || !CFG.siteKey || state.tsWidget !== undefined) return;
     var tries = 0;
@@ -260,8 +260,8 @@
           state.tsWidget = window.turnstile.render("#tsBox", {
             sitekey: CFG.siteKey,
             theme: "dark",
-            callback: function(token){ state.turnstileToken = token; $("humanBtn").disabled = false; $("humanBtn").textContent = "我已通过验证，进入"; },
-            "expired-callback": function(){ state.turnstileToken = ""; $("humanBtn").disabled = true; },
+            callback: function(token){ state.turnstileToken = token; $("humanBtn").disabled = false; $("humanBtn").textContent = "验证通过，进入后台"; },
+            "expired-callback": function(){ state.turnstileToken = ""; $("humanBtn").disabled = true; $("humanBtn").textContent = "验证已过期，请重新验证"; },
             "error-callback": function(){ state.turnstileToken = ""; toast("人机验证组件加载失败，请刷新重试", "bad"); }
           });
         } catch(e){ $("tsBox").innerHTML = '<span class="muted">验证组件初始化失败：' + esc(e.message) + '</span>'; }
@@ -271,14 +271,52 @@
       setTimeout(wait, 250);
     })();
   }
-  function submitHuman(e){
-    if (!state.turnstileToken){ e.preventDefault(); toast("请先完成人机验证", "bad"); return; }
-    $("humanBtn").disabled = true;
-    $("humanBtn").textContent = "验证中…";
-    // 表单本身带 hidden input 不够稳，这里补一个（Turnstile 的 token 也可能在隐藏域里）
-    var hidden = document.createElement("input");
-    hidden.type = "hidden"; hidden.name = "cf-turnstile-response"; hidden.value = state.turnstileToken;
-    $("humanForm").appendChild(hidden);
+
+  /** 第一步：提交密码。密码对 → 展示人机验证；密码错 → 401 */
+  function submitPassword(){
+    var pw = $("gateInput").value.trim();
+    if (!pw){ $("gateErr").textContent = "请输入密码"; $("gateErr").style.display = "block"; return; }
+    $("gateBtn").disabled = true; $("gateBtn").textContent = "校验中…"; $("gateErr").style.display = "none";
+    fetch("/admin/api/login", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ password: pw }) })
+      .then(function(r){ return r.json().catch(function(){ return { ok:false, error:"响应异常 (HTTP " + r.status + ")" }; }).then(function(j){ return { status:r.status, body:j }; }); })
+      .then(function(res){
+        $("gateBtn").disabled = false; $("gateBtn").textContent = "下一步";
+        if (!res.body.ok){
+          $("gateErr").textContent = res.body.error || "密码不正确";
+          $("gateErr").style.display = "block";
+          return;
+        }
+        state.token = pw; localStorage.setItem(TOKEN_KEY, pw);
+        if (res.body.humanRequired){
+          state.pending = res.body.pending || "";
+          showHumanGate(res.body.message || "密码正确，请完成人机验证");
+        } else {
+          hideGate(); load();          // 未开人机认证：密码即全部凭据
+        }
+      });
+  }
+
+  /** 第二步：提交 Turnstile token + pending 票据 */
+  function submitHuman(){
+    if (!state.turnstileToken){ toast("请先完成人机验证", "bad"); return; }
+    $("humanBtn").disabled = true; $("humanBtn").textContent = "验证中…";
+    fetch("/admin/api/verify-human", {
+      method:"POST", headers:{ "content-type":"application/json" },
+      body: JSON.stringify({ token: state.turnstileToken, pending: state.pending })
+    })
+      .then(function(r){ return r.json().catch(function(){ return { ok:false, error:"响应异常 (HTTP " + r.status + ")" }; }); })
+      .then(function(j){
+        if (!j.ok){
+          var e = $("gateErr2"); e.textContent = j.error || "人机验证未通过"; e.style.display = "block";
+          $("humanBtn").disabled = false; $("humanBtn").textContent = "重试";
+          state.turnstileToken = "";
+          if (window.turnstile && state.tsWidget !== undefined) { try { window.turnstile.reset(state.tsWidget); } catch(err){} }
+          if (j.code === "pending_invalid") { setTimeout(function(){ location.reload(); }, 1800); }
+          return;
+        }
+        // Cookie 是服务端下发的，整页刷新最稳
+        location.reload();
+      });
   }
 
   /* ---------- 渲染 ---------- */
@@ -438,31 +476,31 @@
   $("btnLogout").addEventListener("click", function(){
     localStorage.removeItem(TOKEN_KEY); state.token = ""; closeEditor(); showGate();
   });
-  $("gateBtn").addEventListener("click", function(){
-    state.token = $("gateInput").value.trim();
-    localStorage.setItem(TOKEN_KEY, state.token);
-    api("/session").then(function(j){
-      if (j.ok){ hideGate(); $("gateErr2").textContent = ""; load(); }
-      else { $("gateErr2").textContent = j.error || "令牌不正确"; localStorage.removeItem(TOKEN_KEY); state.token = ""; }
-    });
+  $("gateBtn").addEventListener("click", submitPassword);
+  $("gateInput").addEventListener("keydown", function(e){ if (e.key === "Enter") submitPassword(); });
+  $("humanBtn").addEventListener("click", submitHuman);
+  $("gateBack").addEventListener("click", function(){
+    state.pending = ""; state.turnstileToken = "";
+    $("gateErr2").style.display = "none";
+    showGate();
+    $("gateInput").focus();
   });
-  $("gateInput").addEventListener("keydown", function(e){ if (e.key === "Enter") $("gateBtn").click(); });
   $("gateSeed").addEventListener("click", function(){
     var box = $("gateHint");
     box.innerHTML = MODE === "secret"
       ? "本服务用固定密码：执行 <code>wrangler secret put ADMIN_PASSWORD</code> 时你输入的那个值。忘了可以在 Cloudflare 后台改，或删掉 secret 后改用自动令牌模式。"
       : "自动令牌模式下，令牌存在 Cloudflare KV 的 <code>config:admin-token</code> 里；也可以在本地执行 <code>npx wrangler kv key get --binding LLM_FAKE_KV config:admin-token --remote</code> 取回。";
   });
-  $("humanForm").addEventListener("submit", submitHuman);
 
-  /* 启动：先看人机验证是否已通过，再看令牌 */
+  /* 启动：服务端已确认人机验证会话有效（humanVerified）才加载后台数据 */
   if (CFG.message) { var gm = $("gateMsg"); gm.textContent = CFG.message; gm.style.display = "block"; }
   if (CFG.error) { var ge = $("gateErr"); ge.textContent = CFG.error; ge.style.display = "block"; }
-  if (CFG.gateEnabled && !CFG.gateOk) {
-    showHumanGate(CFG.message || "");
-    return;   // 没通过人机验证前，绝不加载后台数据
+  if (CFG.gateEnabled && !CFG.humanVerified) {
+    // 还没过人机验证：先要密码，密码对了再弹验证
+    showGate();
+    if (state.token) $("gateInput").value = state.token;   // 本机存过就填好，省得重敲
+    return;
   }
-  $("gateShield").style.display = CFG.gateEnabled ? "inline-flex" : "none";
   if (!state.token && DYNAMIC_TOKEN) { state.token = DYNAMIC_TOKEN; localStorage.setItem(TOKEN_KEY, state.token); }
   load().then(function(){
     if (!state.token && !$("gate").classList.contains("on")) showGate();

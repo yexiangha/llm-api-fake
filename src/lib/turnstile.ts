@@ -1,15 +1,18 @@
 /**
  * Cloudflare Turnstile 人机认证（保护管理后台 /admin 与 /admin/api/*）
  *
- * 设计：
- *   1. 未通过验证 → /admin 只渲染人机验证页，不吐任何后台数据
- *   2. 前端拿到 Turnstile token → POST /admin/api/verify-human
- *   3. 服务端调 Cloudflare siteverify 校验（必须服务端校验，前端结果不可信）
- *   4. 通过后下发 HttpOnly + Secure 的签名 Cookie（HMAC-SHA256，默认 12 小时）
- *   5. 之后每次后台请求校验 Cookie 签名与有效期；再叠加原有的后台密码校验
+ * 登录顺序（先密码、后人机验证）：
+ *   1. 打开 /admin → 只显示「后台密码」输入框
+ *   2. 提交密码 → POST /admin/api/login
+ *        密码错 → 401（不消耗任何验证配额）
+ *        密码对 → 200 + 一张 5 分钟有效的签名 pending 票据，前端此时才渲染人机验证挂件
+ *   3. 用户在挂件上过验证 → POST /admin/api/verify-human（带 pending 票据 + Turnstile token）
+ *        服务端调 Cloudflare siteverify 校验（必须服务端校验，前端结果不可信）
+ *        通过 → 下发 HttpOnly + Secure + SameSite 的签名会话 Cookie（HMAC-SHA256，默认 12 小时）
+ *   4. 之后的 /admin/api/* 要同时满足：会话 Cookie 有效 + 后台密码正确
  *
- * 两层防护是叠加的，不是替代关系：人机认证挡"机器批量访问"，
- * 后台密码挡"知道地址的人类"。
+ * 这样机器人连验证挂件都看不到（它得先知道密码），
+ * 而 Turnstile 的验证配额只花在密码正确的请求上。
  */
 
 const COOKIE_NAME = 'llm_fake_gate';
@@ -69,7 +72,7 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 export async function issueGateCookie(env: GateEnv, ttlSeconds = DEFAULT_TTL_SECONDS): Promise<string> {
   const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
   const payload = String(expires);
-  const mac = await sign(payload, env.ADMIN_PASSWORD || 'no-password-configured');
+  const mac = await sign(payload, `${env.ADMIN_PASSWORD || 'no-password-configured'}|gate`);
   const value = `${payload}.${mac}`;
   return `${COOKIE_NAME}=${value}; Path=/; Max-Age=${ttlSeconds}; HttpOnly; Secure; SameSite=Lax`;
 }
@@ -86,7 +89,7 @@ export async function gateCookieValid(req: Request, env: GateEnv): Promise<boole
   if (!value) return false;
   const [payload, mac] = value.split('.');
   if (!payload || !mac) return false;
-  const expected = await sign(payload, env.ADMIN_PASSWORD || 'no-password-configured');
+  const expected = await sign(payload, `${env.ADMIN_PASSWORD || 'no-password-configured'}|gate`);
   if (!timingSafeEqualStr(mac, expected)) return false;
   const expires = Number(payload);
   return Number.isFinite(expires) && expires * 1000 > Date.now();
@@ -157,3 +160,32 @@ export function explainCodes(codes: string[]): string {
 }
 
 export { COOKIE_NAME as GATE_COOKIE_NAME, DEFAULT_TTL_SECONDS as GATE_TTL_SECONDS };
+
+/* --------------------------- 密码已过、待验证的票据 --------------------------- */
+
+/** 密码校验通过后签发的短期票据有效期（秒） */
+export const PENDING_TTL_SECONDS = 5 * 60;
+
+/**
+ * 签发「密码已通过、等待人机验证」的票据。
+ * 用它把"密码已验证"这个事实传递到下一步，避免前端在内存里留着密码明文。
+ */
+export async function issuePendingTicket(env: GateEnv, ttlSeconds = PENDING_TTL_SECONDS): Promise<string> {
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const nonce = b64url(crypto.getRandomValues(new Uint8Array(8)));
+  const payload = `${exp}.${nonce}`;
+  const mac = await sign(payload, `${env.ADMIN_PASSWORD || 'no-password-configured'}|pending`);
+  return `${payload}.${mac}`;
+}
+
+/** 校验 pending 票据：签名对、未过期 */
+export async function verifyPendingTicket(ticket: string, env: GateEnv): Promise<boolean> {
+  if (!ticket) return false;
+  const parts = ticket.split('.');
+  if (parts.length !== 3) return false;
+  const [exp, nonce, mac] = parts;
+  const expected = await sign(`${exp}.${nonce}`, `${env.ADMIN_PASSWORD || 'no-password-configured'}|pending`);
+  if (!timingSafeEqualStr(mac, expected)) return false;
+  const expires = Number(exp);
+  return Number.isFinite(expires) && expires * 1000 > Date.now();
+}
