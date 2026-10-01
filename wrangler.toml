@@ -11,9 +11,9 @@ routes = [
 [vars]
 SERVICE_NAME = "llm.yexiangha.top · 假 LLM API"
 SERVICE_VERSION = "1.0.0"
-# 人机认证（Cloudflare Turnstile）：填上 sitekey 并在 secret 里配好 TURNSTILE_SECRET_KEY 才会生效。
-# 两个 key 缺任一 → 后台退回"只校验后台密码"的单层模式。
-# TURNSTILE_SITE_KEY = "0x4AAAAAAA..."
+# 人机认证（Cloudflare Turnstile）：sitekey 在此，secret key 走 `wrangler secret put TURNSTILE_SECRET_KEY`
+# 两个 key 缺任一 → 后台退回"只校验后台密码"的单层模式
+TURNSTILE_SITE_KEY = "0x4AAAAAADme7ko2Bz8v25wP"
 # 仅本地测试可用：把 siteverify 指向假验证端（线上千万别设）
 # TURNSTILE_VERIFY_URL = "http://127.0.0.1:8798/siteverify"
 
