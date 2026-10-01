@@ -188,26 +188,24 @@
 </main>
 
 <div id="gate">
-  <!-- 第一步：后台密码 -->
-  <div class="box" id="gateToken" style="display:none">
-    <h2 style="margin:0 0 .3rem;font-size:15px">需要访问令牌</h2>
-    <p class="muted" id="gateHint" style="margin:.2rem 0 .8rem">输入后台密码/令牌</p>
-    <div class="notice bad" id="gateErr" style="display:none"></div>
-    <input id="gateInput" type="password" placeholder="令牌 / 密码" autocomplete="current-password">
-    <div class="row" style="margin-top:.9rem"><button id="gateBtn">下一步</button><button class="ghost" id="gateSeed" type="button">忘记令牌？</button></div>
-  </div>
-  <!-- 第二步：Cloudflare Turnstile 人机认证（密码正确后才会出现） -->
+  <!-- 第一步：Cloudflare Turnstile 人机认证（每次进入都要过） -->
   <div class="box" id="gateHuman" style="display:none">
-    <h2 style="margin:0 0 .3rem;font-size:15px">再确认一下你是人</h2>
-    <p class="muted" style="margin:.2rem 0 0">密码已通过，最后一步：完成 Cloudflare 人机验证即可进入后台。</p>
+    <h2 style="margin:0 0 .3rem;font-size:15px">请先完成人机验证</h2>
+    <p class="muted" style="margin:.2rem 0 0">本管理后台由 Cloudflare Turnstile 保护，每次进入都需要验证一次。</p>
     <div class="notice ok" id="gateMsg" style="display:none"></div>
     <div class="notice bad" id="gateErr2" style="display:none"></div>
     <div class="ts-box" id="tsBox"></div>
-    <div class="row">
-      <button id="humanBtn" disabled>请先完成上方验证</button>
-      <button class="ghost" id="gateBack" type="button">返回重输密码</button>
-    </div>
-    <p class="muted" style="margin:.7rem 0 0">通过后本机 12 小时内免验证；过期后重新走一次即可。</p>
+    <button id="humanBtn" disabled>请先完成上方验证</button>
+    <p class="muted" style="margin:.7rem 0 0">验证通过后才会出现密码输入框。</p>
+  </div>
+  <!-- 第二步：后台密码 -->
+  <div class="box" id="gateToken" style="display:none">
+    <h2 style="margin:0 0 .3rem;font-size:15px">需要访问令牌</h2>
+    <p class="muted" id="gateHint" style="margin:.2rem 0 .8rem">输入后台密码/令牌</p>
+    <span class="shield" id="gateShield" style="display:none">✓ 人机验证已通过</span>
+    <div class="notice bad" id="gateErr" style="display:none"></div>
+    <input id="gateInput" type="password" placeholder="令牌 / 密码" autocomplete="current-password" style="margin-top:.8rem">
+    <div class="row" style="margin-top:.9rem"><button id="gateBtn">进入</button><button class="ghost" id="gateSeed" type="button">忘记令牌？</button></div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -272,37 +270,13 @@
     })();
   }
 
-  /** 第一步：提交密码。密码对 → 展示人机验证；密码错 → 401 */
-  function submitPassword(){
-    var pw = $("gateInput").value.trim();
-    if (!pw){ $("gateErr").textContent = "请输入密码"; $("gateErr").style.display = "block"; return; }
-    $("gateBtn").disabled = true; $("gateBtn").textContent = "校验中…"; $("gateErr").style.display = "none";
-    fetch("/admin/api/login", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ password: pw }) })
-      .then(function(r){ return r.json().catch(function(){ return { ok:false, error:"响应异常 (HTTP " + r.status + ")" }; }).then(function(j){ return { status:r.status, body:j }; }); })
-      .then(function(res){
-        $("gateBtn").disabled = false; $("gateBtn").textContent = "下一步";
-        if (!res.body.ok){
-          $("gateErr").textContent = res.body.error || "密码不正确";
-          $("gateErr").style.display = "block";
-          return;
-        }
-        state.token = pw; localStorage.setItem(TOKEN_KEY, pw);
-        if (res.body.humanRequired){
-          state.pending = res.body.pending || "";
-          showHumanGate(res.body.message || "密码正确，请完成人机验证");
-        } else {
-          hideGate(); load();          // 未开人机认证：密码即全部凭据
-        }
-      });
-  }
-
-  /** 第二步：提交 Turnstile token + pending 票据 */
+  /** 第一步：过 Turnstile。通过后服务端下发短期会话 Cookie，页面切到密码框 */
   function submitHuman(){
     if (!state.turnstileToken){ toast("请先完成人机验证", "bad"); return; }
     $("humanBtn").disabled = true; $("humanBtn").textContent = "验证中…";
     fetch("/admin/api/verify-human", {
       method:"POST", headers:{ "content-type":"application/json" },
-      body: JSON.stringify({ token: state.turnstileToken, pending: state.pending })
+      body: JSON.stringify({ token: state.turnstileToken })
     })
       .then(function(r){ return r.json().catch(function(){ return { ok:false, error:"响应异常 (HTTP " + r.status + ")" }; }); })
       .then(function(j){
@@ -311,11 +285,28 @@
           $("humanBtn").disabled = false; $("humanBtn").textContent = "重试";
           state.turnstileToken = "";
           if (window.turnstile && state.tsWidget !== undefined) { try { window.turnstile.reset(state.tsWidget); } catch(err){} }
-          if (j.code === "pending_invalid") { setTimeout(function(){ location.reload(); }, 1800); }
           return;
         }
-        // Cookie 是服务端下发的，整页刷新最稳
+        // Cookie 由服务端下发，刷新一次让 humanVerified 生效最稳
         location.reload();
+      });
+  }
+
+  /** 第二步：提交密码（此时已过人机验证） */
+  function submitPassword(){
+    var pw = $("gateInput").value.trim();
+    if (!pw){ $("gateErr").textContent = "请输入密码"; $("gateErr").style.display = "block"; return; }
+    $("gateBtn").disabled = true; $("gateBtn").textContent = "校验中…"; $("gateErr").style.display = "none";
+    api("/login", { method:"POST", body: JSON.stringify({ password: pw }) })
+      .then(function(j){
+        $("gateBtn").disabled = false; $("gateBtn").textContent = "进入";
+        if (!j.ok){
+          $("gateErr").textContent = j.error || "密码不正确";
+          $("gateErr").style.display = "block";
+          return;
+        }
+        state.token = pw; localStorage.setItem(TOKEN_KEY, pw);
+        hideGate(); load();
       });
   }
 
@@ -479,12 +470,6 @@
   $("gateBtn").addEventListener("click", submitPassword);
   $("gateInput").addEventListener("keydown", function(e){ if (e.key === "Enter") submitPassword(); });
   $("humanBtn").addEventListener("click", submitHuman);
-  $("gateBack").addEventListener("click", function(){
-    state.pending = ""; state.turnstileToken = "";
-    $("gateErr2").style.display = "none";
-    showGate();
-    $("gateInput").focus();
-  });
   $("gateSeed").addEventListener("click", function(){
     var box = $("gateHint");
     box.innerHTML = MODE === "secret"
@@ -492,15 +477,18 @@
       : "自动令牌模式下，令牌存在 Cloudflare KV 的 <code>config:admin-token</code> 里；也可以在本地执行 <code>npx wrangler kv key get --binding LLM_FAKE_KV config:admin-token --remote</code> 取回。";
   });
 
-  /* 启动：服务端已确认人机验证会话有效（humanVerified）才加载后台数据 */
+  /* 启动：先人机验证，再输密码。每一步都由服务端状态决定，不靠前端自说自话。 */
   if (CFG.message) { var gm = $("gateMsg"); gm.textContent = CFG.message; gm.style.display = "block"; }
   if (CFG.error) { var ge = $("gateErr"); ge.textContent = CFG.error; ge.style.display = "block"; }
+
   if (CFG.gateEnabled && !CFG.humanVerified) {
-    // 还没过人机验证：先要密码，密码对了再弹验证
-    showGate();
-    if (state.token) $("gateInput").value = state.token;   // 本机存过就填好，省得重敲
+    // 没通过人机验证 → 只给验证挂件，连密码框都不显示
+    showHumanGate(CFG.message || "");
     return;
   }
+
+  // 已过人机验证：显示密码框；本机存过密码就直接进后台
+  $("gateShield").style.display = CFG.gateEnabled ? "inline-flex" : "none";
   if (!state.token && DYNAMIC_TOKEN) { state.token = DYNAMIC_TOKEN; localStorage.setItem(TOKEN_KEY, state.token); }
   load().then(function(){
     if (!state.token && !$("gate").classList.contains("on")) showGate();

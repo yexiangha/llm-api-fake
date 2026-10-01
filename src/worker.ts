@@ -35,7 +35,7 @@ import {
   shortHash,
   type TemplateVars,
 } from './lib/template';
-import { explainCodes, gateConfig, gateCookieValid, issueGateCookie, issuePendingTicket, verifyPendingTicket, verifyTurnstile } from './lib/turnstile';
+import { explainCodes, gateConfig, gateCookieValid, gateTtlSeconds, issueGateCookie, verifyTurnstile } from './lib/turnstile';
 
 export interface Env {
   LLM_FAKE_KV: KVNamespace;
@@ -420,6 +420,7 @@ async function adminPage(env: Env, req: Request, url: URL): Promise<Response> {
     gateEnabled: gate.enabled,
     humanVerified,
     siteKey: gate.siteKey,
+    gateTtlMinutes: Math.round((gateTtlSeconds(env) / 60) * 10) / 10,
     mode: env.ADMIN_PASSWORD ? 'secret' : 'dynamic',
     dynamicToken: dynamicToken || '',
     message: (url.searchParams.get('msg') || '').slice(0, 200),
@@ -446,8 +447,9 @@ async function passwordMatches(provided: string, env: Env): Promise<boolean> {
 }
 
 /**
- * 第一步：校验后台密码。
- * 密码正确时（且开了人机认证）返回一张 5 分钟 pending 票据，前端拿到它才去渲染验证挂件。
+ * 第二步：校验后台密码。
+ * 注意：这一步在「人机验证会话」之后，由 handleAdmin 的路由顺序保证——
+ * 没过人机验证的请求根本走不到这里。
  */
 async function handleLogin(req: Request, env: Env): Promise<Response> {
   let payload: { password?: string } = {};
@@ -462,41 +464,22 @@ async function handleLogin(req: Request, env: Env): Promise<Response> {
   if (!(await passwordMatches(provided, env))) {
     return json({ ok: false, error: '密码不正确', code: 'bad_password' }, 401);
   }
-
-  const gate = gateConfig(env);
-  if (!gate.enabled) return json({ ok: true, humanRequired: false, message: '密码正确（本实例未开启人机认证）' });
-
-  return json({
-    ok: true,
-    humanRequired: true,
-    siteKey: gate.siteKey,
-    pending: await issuePendingTicket(env),
-    message: '密码正确，请完成人机验证',
-  });
+  return json({ ok: true, message: '密码正确', gateTtlSeconds: gateTtlSeconds(env) });
 }
 
-/**
- * 第二步：校验 Turnstile token（必须带第一步的 pending 票据），通过后下发会话 Cookie。
- */
+/** 第一步：校验 Turnstile token，通过后下发短期会话 Cookie */
 async function handleVerifyHuman(req: Request, env: Env): Promise<Response> {
   const gate = gateConfig(env);
   if (!gate.enabled) return json({ ok: true, humanRequired: false, message: '本实例未开启人机认证' });
 
   let token = '';
-  let pending = '';
   const contentType = req.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
-    const body = (await req.json().catch(() => ({}))) as { token?: string; pending?: string };
+    const body = (await req.json().catch(() => ({}))) as { token?: string };
     token = String(body.token || '');
-    pending = String(body.pending || '');
   } else {
     const form = await req.formData().catch(() => null);
-    token = String(form?.get('cf-turnstile-response') || '');
-    pending = String(form?.get('pending') || '');
-  }
-
-  if (!(await verifyPendingTicket(pending, env))) {
-    return json({ ok: false, error: '请先输入正确的后台密码（票据无效或已过期）', code: 'pending_invalid' }, 401);
+    token = String(form?.get('cf-turnstile-response') || req.headers.get('cf-turnstile-response') || '');
   }
 
   const result = await verifyTurnstile(env, token, req.headers.get('cf-connecting-ip'));
@@ -506,7 +489,11 @@ async function handleVerifyHuman(req: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: `人机验证未通过：${reason}`, code: 'human_failed', codes: result.codes }, 400);
   }
 
-  return json({ ok: true, message: '人机验证通过' }, 200, { 'set-cookie': await issueGateCookie(env) });
+  return json(
+    { ok: true, message: '人机验证通过，请输入后台密码', gateTtlSeconds: gateTtlSeconds(env) },
+    200,
+    { 'set-cookie': await issueGateCookie(env) },
+  );
 }
 
 async function handleAdmin(req: Request, env: Env, url: URL, path: string, method: string): Promise<Response> {
@@ -515,30 +502,32 @@ async function handleAdmin(req: Request, env: Env, url: URL, path: string, metho
   const route = path.slice('/admin/api'.length).replace(/^\/+/, '');
   const gate = gateConfig(env);
 
-  // 登录两步都不需要"已经登录"
-  if (route === 'login') {
-    if (method !== 'POST') return json({ ok: false, error: '请用 POST 提交' }, 405);
-    return handleLogin(req, env);
-  }
+  // 第一步（人机认证）本身不能要求"已经通过验证"
   if (route === 'verify-human') {
     if (method !== 'POST') return json({ ok: false, error: '请用 POST 提交' }, 405);
     return handleVerifyHuman(req, env);
   }
 
-  // 第一道：人机认证会话（Turnstile 配置了才开）
+  // 第一道门：人机验证会话（Turnstile 配置了才开）
+  // 放在最前面，保证没过验证时连"密码对不对"都探测不到
   if (gate.enabled && !(await gateCookieValid(req, env))) {
     return json(
       {
         ok: false,
         error: '需要先通过人机验证',
         code: 'human_verification_required',
-        hint: '打开 /admin，输入后台密码后按提示完成 Cloudflare 人机验证（本次会话 12 小时内有效）',
+        hint: '打开 /admin 完成 Cloudflare 人机验证（每次进入都要验，验证会话仅 ' + Math.round(gateTtlSeconds(env) / 60) + ' 分钟）',
       },
       403,
     );
   }
 
-  // 第二道：后台密码
+  // 第二道门：后台密码
+  if (route === 'login') {
+    if (method !== 'POST') return json({ ok: false, error: '请用 POST 提交' }, 405);
+    return handleLogin(req, env);
+  }
+
   const auth = await adminAuth(req, env);
   if (!auth.ok) {
     return json(

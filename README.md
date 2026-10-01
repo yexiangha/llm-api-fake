@@ -114,25 +114,27 @@ npx wrangler deploy
 - **全局设置**：服务名、默认模型名、默认延迟、是否强制校验 `sk-` 开头的 key
 - **试跑**：输入一句话，直接看会命中哪条规则、返回什么
 
-### 两道门：先输密码，再做人机认证
+### 两道门：先人机验证，再输密码（每次进后台都要验）
 
 ```
-打开 /admin  →  ① 输入后台密码（ADMIN_PASSWORD）  →  ② Cloudflare Turnstile 人机验证  →  进入后台
-                   密码错：401，不弹验证           过了：下发 12 小时签名会话 Cookie
+打开 /admin  →  ① Cloudflare Turnstile 人机验证  →  ② 输入后台密码（ADMIN_PASSWORD）  →  进入后台
+                   每次打开页面都要过一遍              过了验证才会出现密码框
 ```
 
-顺序是「先密码、后人机验证」，好处是：**机器人连验证挂件都看不到**（得先知道密码），
-Turnstile 的验证配额也只花在密码正确的请求上。
+要点：
+
+- **每次都跳验证**：只要人机认证开着，打开 `/admin` 就无条件渲染验证挂件，没有"验证一次管半天"的免验证通道
+- **顺序不可绕过**：未过验证时 `/admin/api/*`（**包括登录接口**）一律返回 `403 {"code":"human_verification_required"}`，连"密码对不对"都探测不到
+- 验证会话只为单次登录流程服务，窗口很短（默认 **30 分钟**，可用 `GATE_TTL_SECONDS` 调整），过期后重新要求验证
 
 | 步骤 | 接口 | 行为 |
 |---|---|---|
-| ① 校验密码 | `POST /admin/api/login` | 密码错 → `401 {"code":"bad_password"}`；密码对 → `200` + `humanRequired` + 一张 **5 分钟有效**的签名 pending 票据 |
-| ② 人机验证 | `POST /admin/api/verify-human` | 带 pending 票据 + Turnstile token；服务端调 Cloudflare siteverify 校验，通过 → 下发会话 Cookie |
-| 之后 | `/admin/api/*` | 同时要求 **会话 Cookie 有效**（HMAC-SHA256 签名、绑定后台密码、12 小时）+ **密码正确** |
+| ① 人机验证 | `POST /admin/api/verify-human` | 服务端调 Cloudflare siteverify 校验 token；通过 → 下发 `HttpOnly + Secure + SameSite=Lax` 的 HMAC 签名会话 Cookie |
+| ② 校验密码 | `POST /admin/api/login` | 需带有效会话；密码错 → `401 bad_password`，对 → `200` |
+| 之后 | `/admin/api/*` | 同时要求 **会话有效** + **密码正确** |
 
-- pending 票据防伪造、防过期：没有它直接跳过密码去调第 ② 步会被 `401 pending_invalid` 挡回
-- 会话 Cookie 是 `HttpOnly + Secure + SameSite=Lax`；篡改过期时间、改签名、伪造都会被拒
-- 改后台密码会让所有旧 Cookie 立即失效（HMAC 密钥含密码）
+- 会话 Cookie 绑定后台密码（HMAC 密钥含密码），改密码 → 所有旧会话立即失效
+- 篡改过期时间、改签名、伪造长期 Cookie 都会被拒
 - 没配置 `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` 时自动退回"只校验密码"的单层模式
 
 **开启方式**（不配置就是关闭状态）：
@@ -148,15 +150,16 @@ npx wrangler deploy
 
 > 用 Cloudflare 官方测试 key（sitekey `1x00000000000000000000AA` + 对应测试 secret）可以先不建 widget 跑通流程。
 
-**本地怎么测人机认证**：仓库里带了可控的假验证端，能完整覆盖"通过 / 重放 / 失败"三条路径——
+**本地怎么测人机认证**：仓库里带了可控的假验证端，能完整覆盖"通过 / 重放 / 失败 / 会话过期"四条路径——
 
 ```bash
 node scripts/mock-turnstile.mjs 8798 &            # 假 siteverify：PASS* 通过、DUP* 重放失败、其它拒绝
-# .dev.vars 里指向它：
+# .dev.vars 里指向它（GATE_TTL_SECONDS 调小才能实测"过期后重新要求验证"）：
 #   TURNSTILE_SITE_KEY=1x00000000000000000000AA
 #   TURNSTILE_SECRET_KEY=dev-local-turnstile-secret
 #   TURNSTILE_VERIFY_URL=http://127.0.0.1:8798/siteverify
-node scripts/test-turnstile.mjs http://127.0.0.1:8799 dev-local-password   # 38 项检查
+#   GATE_TTL_SECONDS=12
+node scripts/test-turnstile.mjs http://127.0.0.1:8799 dev-local-password   # 31 项检查
 ```
 
 ### 响应内容里的占位符
@@ -285,7 +288,7 @@ pnpm deploy         # 部署到 Cloudflare
 node scripts/smoke.mjs https://llm.yexiangha.top 你的后台密码   # 线上冒烟（37+ 项）
 node scripts/seed-live.mjs https://llm.yexiangha.top 后台密码    # 给线上灌示例规则
 node scripts/gh-sync.mjs                                          # 网络受限时用 API 推 GitHub
-node scripts/test-turnstile.mjs http://127.0.0.1:8799 后台密码     # 人机认证端到端（38 项）
+node scripts/test-turnstile.mjs http://127.0.0.1:8799 后台密码     # 人机认证端到端（31 项）
 node scripts/mock-turnstile.mjs 8798                              # 本地假 siteverify 服务
 
 # 忘了后台令牌（未设置 ADMIN_PASSWORD 时）
@@ -300,6 +303,7 @@ pnpm kv:token
 | secret | `TURNSTILE_SECRET_KEY` | Turnstile 私密 key；与 sitekey 同时配置才开启人机认证 |
 | vars | `TURNSTILE_SITE_KEY` | Turnstile 公开 sitekey（可写进 wrangler.toml） |
 | vars | `TURNSTILE_VERIFY_URL` | 仅本地测试：把 siteverify 指到假端，线上不要设 |
+| vars | `GATE_TTL_SECONDS` | 验证会话存活秒数（默认 1800；本地测试可调小） |
 | vars | `SERVICE_NAME` | 服务展示名 |
 | vars | `SERVICE_VERSION` | 版本号（`/health` 与首页展示） |
 | KV | `LLM_FAKE_KV` | 规则与设置存储 |

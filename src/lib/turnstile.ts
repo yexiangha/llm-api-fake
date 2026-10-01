@@ -1,28 +1,34 @@
 /**
  * Cloudflare Turnstile 人机认证（保护管理后台 /admin 与 /admin/api/*）
  *
- * 登录顺序（先密码、后人机验证）：
- *   1. 打开 /admin → 只显示「后台密码」输入框
- *   2. 提交密码 → POST /admin/api/login
- *        密码错 → 401（不消耗任何验证配额）
- *        密码对 → 200 + 一张 5 分钟有效的签名 pending 票据，前端此时才渲染人机验证挂件
- *   3. 用户在挂件上过验证 → POST /admin/api/verify-human（带 pending 票据 + Turnstile token）
+ * 登录顺序（先人机验证、后输密码）：
+ *   1. 打开 /admin → 直接渲染 Cloudflare Turnstile 挂件（不吐任何后台数据）
+ *   2. 过验证 → POST /admin/api/verify-human（token 可带 pending 票据，也可不带）
  *        服务端调 Cloudflare siteverify 校验（必须服务端校验，前端结果不可信）
- *        通过 → 下发 HttpOnly + Secure + SameSite 的签名会话 Cookie（HMAC-SHA256，默认 12 小时）
- *   4. 之后的 /admin/api/* 要同时满足：会话 Cookie 有效 + 后台密码正确
+ *        通过 → 下发 HttpOnly + Secure + SameSite 的短期会话 Cookie（HMAC-SHA256）
+ *   3. 拿到会话 → 页面切换成「后台密码」输入框 → POST /admin/api/login 校验密码
+ *   4. 进入后台后，/admin/api/* 要同时满足：会话 Cookie 有效 + 后台密码正确
  *
- * 这样机器人连验证挂件都看不到（它得先知道密码），
- * 而 Turnstile 的验证配额只花在密码正确的请求上。
+ * 「每次都跳」：会话 Cookie 的存活窗口刻意设得很短（默认 30 分钟），
+ * 而且每次重新打开 /admin 都会重新渲染挂件要求验证，
+ * 所以不存在"一次验证管 12 小时"的免验证通道。
  */
 
 const COOKIE_NAME = 'llm_fake_gate';
-const DEFAULT_TTL_SECONDS = 12 * 60 * 60;
+/**
+ * 会话 Cookie 存活时间。刻意设短，实现"每次进后台都要过验证"：
+ * 30 分钟后自动失效，重新打开 /admin 就得再验证一次。
+ * 单次登录过程（验证 → 输密码 → 用后台）通常几分钟内完成，够用。
+ */
+const DEFAULT_TTL_SECONDS = 30 * 60;
 
 export interface GateEnv {
   ADMIN_PASSWORD?: string;
   TURNSTILE_SITE_KEY?: string;
   /** 仅本地测试用：把 siteverify 指到自建假端（线上不要设） */
   TURNSTILE_VERIFY_URL?: string;
+  /** 仅本地测试用：覆盖会话 Cookie 存活秒数 */
+  GATE_TTL_SECONDS?: string;
 }
 
 export interface GateConfig {
@@ -69,12 +75,19 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 }
 
 /** 生成通过验证的会话 Cookie（值为 过期时间戳.签名） */
-export async function issueGateCookie(env: GateEnv, ttlSeconds = DEFAULT_TTL_SECONDS): Promise<string> {
+export async function issueGateCookie(env: GateEnv, ttlSeconds = gateTtlSeconds(env)): Promise<string> {
   const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
   const payload = String(expires);
   const mac = await sign(payload, `${env.ADMIN_PASSWORD || 'no-password-configured'}|gate`);
   const value = `${payload}.${mac}`;
   return `${COOKIE_NAME}=${value}; Path=/; Max-Age=${ttlSeconds}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+/** 会话存活秒数：默认 30 分钟，本地测试可用 GATE_TTL_SECONDS 覆盖 */
+export function gateTtlSeconds(env: GateEnv): number {
+  const override = Number((env.GATE_TTL_SECONDS || '').trim());
+  if (Number.isFinite(override) && override > 0) return Math.floor(override);
+  return DEFAULT_TTL_SECONDS;
 }
 
 export function readGateCookie(req: Request): string {
@@ -178,7 +191,7 @@ export async function issuePendingTicket(env: GateEnv, ttlSeconds = PENDING_TTL_
   return `${payload}.${mac}`;
 }
 
-/** 校验 pending 票据：签名对、未过期 */
+/** 校验 pending 票据：签名对、未过期（当前登录流程已不用票据，保留给外部集成） */
 export async function verifyPendingTicket(ticket: string, env: GateEnv): Promise<boolean> {
   if (!ticket) return false;
   const parts = ticket.split('.');
